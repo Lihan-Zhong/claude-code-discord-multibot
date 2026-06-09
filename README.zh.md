@@ -4,6 +4,8 @@
 
 让 Claude Code 每个项目目录绑定一个独立的 Discord bot · 互不干扰 · 切项目只需在 Discord 切频道 · 支持上百个 bot 规模
 
+> **姐妹仓库:** [`claude-code-telegram-multibot`](https://github.com/Lihan-Zhong/claude-code-telegram-multibot) —— 同样架构的 Telegram 版本。如果你撞上了 Telegram @BotFather 的 20 bot 上限，或者想用 Discord 独家功能（`fetch_messages` 消息历史、双向 reactions 等），就用本仓库。
+
 > **太长不看版** —— 把官方 `[discord` 插件](https://github.com/anthropics/claude-plugins-official) 配上几个 shell 函数和一份 Claude Code skill，让每个项目目录拥有自己的 Discord bot。切项目只需在 Discord 里换频道，不再需要切终端。姐妹项目 `[claude-code-telegram-multibot](https://github.com/Lihan-Zhong/claude-code-telegram-multibot)` —— 同样的架构，换平台部署。
 >
 > 当你撞上 Telegram 的 20 bot 上限，或者想要更丰富的功能（消息历史查询 `fetch_messages`、双向 reaction、threads、channel 树状组织）时，用这个 Discord 版本。

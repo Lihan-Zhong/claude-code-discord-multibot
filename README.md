@@ -4,6 +4,8 @@
 
 One dedicated Discord bot per Claude Code project · independent state · zero cross-talk · scales to hundreds of bots
 
+> **Sibling project:** [`claude-code-telegram-multibot`](https://github.com/Lihan-Zhong/claude-code-telegram-multibot) — same architecture on Telegram. Pick this Discord version if you've outgrown Telegram's 20-bot @BotFather cap, or want Discord-only features like `fetch_messages` and bidirectional reactions.
+
 > **TL;DR** — pair the official `[discord` plugin](https://github.com/anthropics/claude-plugins-official) with a few shell functions and a Claude Code skill, so each project directory gets its own Discord bot. Switch projects in Discord by switching channels, not terminals. Sister project to `[claude-code-telegram-multibot](https://github.com/Lihan-Zhong/claude-code-telegram-multibot)` — same architecture, different platform.
 >
 > Use Discord when you've outgrown Telegram's 20-bot hard cap, or want richer features: message history via `fetch_messages`, bidirectional reactions, threads, channel-based organization.
