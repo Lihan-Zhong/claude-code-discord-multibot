@@ -1,0 +1,18 @@
+# Never commit secrets
+.env
+*.env
+**/.env
+
+# Per-project state dirs that may contain tokens
+.claude-discord/
+.claude/channels/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs
+*.log
