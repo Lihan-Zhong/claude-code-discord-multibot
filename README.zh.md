@@ -39,7 +39,15 @@ source ~/.bashrc
 # 3. 安装 skill（让 Claude Code agent 懂这套架构）
 mkdir -p ~/.claude/skills/setup-discord-multibot
 cp SKILL.md ~/.claude/skills/setup-discord-multibot/SKILL.md
+
+# 4. 可选但强烈建议：插件补丁 + 两个钩子（见下面「机制层」）
+cp patch-discord-plugin.sh ~/.claude/ && chmod +x ~/.claude/patch-discord-plugin.sh
+mkdir -p ~/.claude/hooks && cp hooks/*.py ~/.claude/hooks/
+~/.claude/patch-discord-plugin.sh          # 幂等，随时可重跑
 ```
+
+> ⚠️ 钩子必须注册在 **`~/.claude/settings.json`**，不能放 `settings.local.json` ——
+> 原因见下面的[机制层](#-机制层钩子--插件补丁)。
 
 给某个项目加一个 bot：
 
@@ -81,11 +89,15 @@ cd claude-code-discord-multibot
 
 ## 📁 仓库内容
 
-- `**claude-dc.bash`** —— 四个 shell 函数：`claude-dc`、`claude-dc-init`、`claude-dc-alt`、`claude-dc-pair`。从 `~/.bashrc` source。
-- `**SKILL.md**` —— Claude Code skill，教 agent 掌握这套架构。放到 `~/.claude/skills/setup-discord-multibot/SKILL.md`。
-- `**README.md**` / `**README.zh.md**` —— 本文件的英文/中文版。
-- `**LICENSE**` —— MIT。
-- `**.gitignore**` —— 默认排除 token 和 state 目录，避免误提交。
+- **`claude-dc.bash`** —— 六个 shell 函数：`claude-dc`、`claude-dc-init`、`claude-dc-alt`、`claude-dc-pair`，以及会判断 session 归属的 `claude-dc-resume` / `claude-dc-alt-resume`。从 `~/.bashrc` source。
+- **`patch-discord-plugin.sh`** —— 对插件 `server.ts` 的三个幂等补丁：bot 之间能互相看到消息、真实的在线状态、markdown 安全的消息切分。可重复运行，插件升级后会自愈。
+- **`hooks/enforce-discord-reply.py`** —— `Stop` 钩子。由 Discord 触发的回合，没往 Discord 回复就不许结束。
+- **`hooks/guard-variant-memory.py`** —— `PreToolUse` 钩子。alt bot 不能写进别的 bot 的记忆命名空间。
+- **`SKILL.md`** —— Claude Code skill，教 agent 掌握这套架构。放到 `~/.claude/skills/setup-discord-multibot/SKILL.md`。
+- **`README.md`** / **`README.zh.md`** —— 本文件的英文/中文版。
+- **`CHANGELOG.md`** —— 版本之间改了什么。
+- **`LICENSE`** —— MIT。
+- **`.gitignore`** —— 默认排除 token 和 state 目录，避免误提交。
 
 ## 🧩 同一项目下开两个 bot（alt 模式）
 
@@ -111,6 +123,74 @@ SANDBOX="Intermediate_data/for_claude${CLAUDE_BOT_VARIANT:+_${CLAUDE_BOT_VARIANT
 
 主 bot 写到 `Intermediate_data/for_claude/`，alt bot 写到 `Intermediate_data/for_claude_2/`。互不覆盖。
 
+### 恢复到正确的那个 session
+
+Claude Code 的 session **只按工作目录索引** —— 没有任何东西把 session 和 `DISCORD_STATE_DIR` 绑在一起。所以同一目录下有两只 bot 时，`-c` 会挑「最近的那个」，等于抛硬币；`-r` 的选择器把两个都列出来，却不告诉你哪个是哪个。两个辅助函数替你做归属判断：
+
+```bash
+claude-dc-resume         # 恢复主 bot 自己的 session
+claude-dc-alt-resume 2   # 恢复 alt 2 自己的 session
+claude-dc-resume <sid>   # 逃生口：直接指定 session id
+```
+
+两者用的判据**不一样**，而这个差别才是重点。alt 好办：数每份 transcript 引用 `memory/variant_<N>/`（它自己的命名空间）的次数就行。主 bot 不能简单反过来判 —— 它的 transcript 里 `variant_2` 出现得也不少，因为你就是在它里面讨论 alt 的。真正能区分的是**这些提及出现在什么位置**：只给 session 的**开头**打分，那部分是 harness 注入的内容，不是后面聊出来的。在一个真实的五 session 目录上，按全文打分完全分不开，按开头打分则是主 bot 0 分、每个 alt 3～4 分。
+
+两个函数都不瞎猜：没有明确归属时就新开，并且告诉你。
+
+## 🛡️ 机制层（钩子 + 插件补丁）
+
+v1 交付的是**约定**。约定的问题在于：它恰好在最需要的时候失效 —— 长 tool 链的末尾、压力最大的时候。v2 把其中重要的几条沉到 harness 里。
+
+| | 做什么 | 形态 |
+|---|---|---|
+| `hooks/enforce-discord-reply.py` | `Stop` 钩子 —— 由 Discord 触发、却没调用 `reply`/`react`/`edit_message` 的回合，不许结束 | **拦截** |
+| `hooks/guard-variant-memory.py` | `PreToolUse` 钩子 —— 拒绝写入任何不属于本 alt 的 `memory/variant_N/` 之外的记忆命名空间 | **拦截** |
+| `patch-discord-plugin.sh` #1 | 让同一频道里的 bot 能看见彼此的消息（只丢弃自己的回声） | 变换 |
+| `patch-discord-plugin.sh` #2 | 真实的在线状态，绿点等于「真的连着」 | 变换 |
+| `patch-discord-plugin.sh` #3 | markdown 安全的 2000 字符切分 —— 代码块不会被劈成两半 | **变换** |
+
+**能做成变换的，就别做成拦截。** 拦截仍然会产生一个「被拦了」的事件，需要有人看见、有人处理；变换没有失败事件可报，对的东西直接就出来了 —— 没人需要知道那个 chunker 存在。
+
+两个钩子都是 **fail-open**：输入异常、工具不认识、transcript 找不到、内部报错 —— 一律放行。一个会卡死每个 session 的守卫，比它要防的那个失误更糟。
+
+### ⚠️ 钩子只从 `~/.claude/settings.json` 加载
+
+这条让我们白丢了两周，而且**没有任何报错和警告**。Claude Code 的 settings 加载链是：
+
+```
+<project>/.claude/settings.local.json → <project>/.claude/settings.json → ~/.claude/settings.json
+```
+
+**`~/.claude/settings.local.json` 不在这条链上。** 放在那里的 `hooks` 段会被静默忽略。正确写法：
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/usr/bin/python3 $HOME/.claude/hooks/enforce-discord-reply.py" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Write|Edit|NotebookEdit|Bash",
+        "hooks": [{ "type": "command", "command": "/usr/bin/python3 $HOME/.claude/hooks/guard-variant-memory.py" }] }
+    ]
+  }
+}
+```
+
+**另外：别用「项目目录就是 `$HOME`」的那只 bot 去验证这件事。** 对它来说 `~/.claude/settings.local.json` 恰好**就是**项目级配置文件，是链上第一个 —— 所以只在它那里生效，别处都不生效。这正是这个 bug 藏了两周的原因。要验证就去真正的项目 bot 里验。
+
+### 怎么让补丁活下去
+
+`patch-discord-plugin.sh` 改的是插件自己的文件，插件一升级就会被覆盖。这件事是处理过的，但值得知道是怎么处理的：
+
+- 启动器在每次开 shell 时调一遍脚本；脚本幂等，没必要打的时候就是空转。
+- 真正在跑的插件加载的是 **cache 那份**（`~/.claude/plugins/cache/.../discord/<版本号>/server.ts`），按版本号钉死。升级会生成新的版本目录，而补丁目标是通配符，所以覆盖得到。
+- 如果上游把 `chunk()` 整个改名，脚本会打印 `[warn]` 并**原样不动**，而不是写出一个坏文件。补丁 #3 还会额外跑一次转译检查，结果不合法就自动回滚。
+- 再加一道保险：给每个 bot 的 `access.json` 写上 `"chunkMode": "newline"`。补丁在的时候它不起作用；补丁完全没了的时候，它保证你至少还是按行切，而不是硬 `slice(0, 2000)`。
+
+**已经在跑的 bot 不会吃到新补丁**，必须重启。
+
 ## 🤖 多 bot 协同（Discord 独家优势）
 
 跟 Telegram 不同，Discord 允许多个 bot 共享一个 channel 并看到彼此的消息。这开启了"几个 agent 在同一个房间里协作"的玩法 —— 比如 `@planner_bot` / `@coder_bot` / `@reviewer_bot` 都在一个 channel 里，通过 @mention 协调。
@@ -135,11 +215,15 @@ SANDBOX="Intermediate_data/for_claude${CLAUDE_BOT_VARIANT:+_${CLAUDE_BOT_VARIANT
 
 ## 🐛 已知问题
 
-> 完整排查清单见 `[SKILL.md](SKILL.md)`。
+> 完整排查清单见 [`SKILL.md`](SKILL.md)。
 
+- **注册了的钩子从来不触发。** 八成是放进了 `~/.claude/settings.local.json` —— 那个文件**不在** settings 加载链上。把 `hooks` 段搬到 `~/.claude/settings.json`。这件事没有任何报错。详见[机制层](#-机制层钩子--插件补丁)。
+- **从项目子目录启动时插件不加载。** Claude Code 2.1.181 起，插件必须装在 **user scope** —— project scope 不再向子目录继承。用 `claude plugin list | grep -A2 discord` 检查，`Scope:` 必须是 `user`。症状：启动横幅提到 channels，但 `/mcp` 里没有 discord，插件子进程根本没被拉起来。
+- **某个 bot 的记忆落到了别的项目的桶里。** `$HOME` 下有一个损坏或空的 `.git`（哪怕 `git` 自己都不认）就足以让 harness 的 project root 上溯停在那儿，于是所有自己没有 `.git` 的 bot 都把 project root 解析成了 `$HOME`。而 transcript 仍然按工作目录存 —— 这正是它难被发现的原因。删掉那个多余的 `.git`；完整的排查与归位流程在 `SKILL.md` 里，包括**为什么只按记忆文件名匹配不能作为作者证据**。
+- **长回复被从代码块中间切开。** 那是上游 `chunk()` 在做无脑 `slice(0, 2000)`。打上 `patch-discord-plugin.sh`（补丁 #3）。注意：只把 `chunkMode` 改成 `'newline'` **治不好** —— 代码块里全是换行，它照样切在块内。
 - **入站消息到不了 agent（单向通信）。** 最常见原因：组织策略没把 `discord` 加进 `allowedChannelPlugins`。Admin 必须通过 Claude.ai 管理员控制台 → Claude Code → Channels 添加。本地编辑 `~/.claude/remote-settings.json` 没用，服务器 1 小时内会覆盖回去。
-- `**/discord:access pair` 报 "code not found"。** 官方 skill 硬编码默认的 state 目录路径，不尊重 `DISCORD_STATE_DIR`。改用本仓库的 `claude-dc-pair`，或按 SKILL.md 走手动文件编辑流程。
-- **MCP "failed — Skipping connection" 被缓存。** 在 Claude Code 里跑 `/doctor` 然后 `/mcp`，`/mcp` 提供手动重试。
+- **`/discord:access pair` 报 "code not found"。** 官方 skill 硬编码默认的 state 目录路径，不尊重 `DISCORD_STATE_DIR`。改用本仓库的 `claude-dc-pair`，或按 SKILL.md 走手动文件编辑流程。
+- **MCP "failed — Skipping connection" 被缓存。** 在 Claude Code 里跑 `/doctor` 然后 `/mcp`，`/mcp` 提供手动重试。别去调大 `MCP_TIMEOUT`：延长等待只在「本来就快连上了」的情况下有用；本来就连不上的时候，你只是把一个**快速失败换成了缓慢失败** —— 实测表现为启动卡满整个超时、连 Ctrl-C 都难打断。
 - **Discord bot 看不到消息内容。** 去 Developer Portal → Bot → Privileged Gateway Intents 开启 "Message Content Intent"。
 - **会话中途 `stop_reason: refusal`。** Anthropic 安全分类器对体积过大的 session 可能假阳性。恢复方法：`/exit` 后用 `claude-dc`（**不带 `-c`/`-r`**，否则会复活被污染的 session），通过读文件重建上下文。预防：单次 tool 输出控制在小尺寸（`head -5` 而不是 `cat`），大结果落到文件里、引用路径而不是粘贴内容。
 
