@@ -32,8 +32,9 @@
 git clone https://github.com/Lihan-Zhong/claude-code-discord-multibot.git
 cd claude-code-discord-multibot
 
-# 2. 加载 shell 函数
+# 2. 加载 shell 函数，并安装恢复 session 时要用的归属判断脚本
 echo "source $PWD/claude-dc.bash" >> ~/.bashrc
+mkdir -p ~/.claude && cp claude-dc-pick-session.py ~/.claude/
 source ~/.bashrc
 
 # 3. 安装 skill（让 Claude Code agent 懂这套架构）
@@ -90,6 +91,7 @@ cd claude-code-discord-multibot
 ## 📁 仓库内容
 
 - **`claude-dc.bash`** —— 六个 shell 函数：`claude-dc`、`claude-dc-init`、`claude-dc-alt`、`claude-dc-pair`，以及会判断 session 归属的 `claude-dc-resume` / `claude-dc-alt-resume`。从 `~/.bashrc` source。
+- **`claude-dc-pick-session.py`** —— 判断哪个 session 属于哪只 bot：看最后一条消息是从哪只 bot 的私信频道送进来的。恢复函数和 `-c` 改道都靠它。复制到 `~/.claude/`。
 - **`patch-discord-plugin.sh`** —— 对插件 `server.ts` 的三个幂等补丁：bot 之间能互相看到消息、真实的在线状态、markdown 安全的消息切分。可重复运行，插件升级后会自愈。
 - **`hooks/enforce-discord-reply.py`** —— `Stop` 钩子。由 Discord 触发的回合，没往 Discord 回复就不许结束。
 - **`hooks/guard-variant-memory.py`** —— `PreToolUse` 钩子。alt bot 不能写进别的 bot 的记忆命名空间。
@@ -125,7 +127,7 @@ SANDBOX="Intermediate_data/for_claude${CLAUDE_BOT_VARIANT:+_${CLAUDE_BOT_VARIANT
 
 ### 恢复到正确的那个 session
 
-Claude Code 的 session **只按工作目录索引** —— 没有任何东西把 session 和 `DISCORD_STATE_DIR` 绑在一起。所以同一目录下有两只 bot 时，`-c` 会挑「最近的那个」，等于抛硬币；`-r` 的选择器把两个都列出来，却不告诉你哪个是哪个。两个辅助函数替你做归属判断：
+Claude Code 的 session **只按工作目录索引** —— 没有任何东西把 session 和 `DISCORD_STATE_DIR` 绑在一起。所以同一目录下有两只 bot 时，直接 `-c` 会接上「最新的那份」transcript，不管是谁写的；`-r` 的选择器把两个都列出来，却不告诉你哪个是哪个。两个辅助函数替你恢复对的那个：
 
 ```bash
 claude-dc-resume         # 恢复主 bot 自己的 session
@@ -133,9 +135,13 @@ claude-dc-alt-resume 2   # 恢复 alt 2 自己的 session
 claude-dc-resume <sid>   # 逃生口：直接指定 session id
 ```
 
-两者用的判据**不一样**，而这个差别才是重点。alt 好办：数每份 transcript 引用 `memory/variant_<N>/`（它自己的命名空间）的次数就行。主 bot 不能简单反过来判 —— 它的 transcript 里 `variant_2` 出现得也不少，因为你就是在它里面讨论 alt 的。真正能区分的是**这些提及出现在什么位置**：只给 session 的**开头**打分，那部分是 harness 注入的内容，不是后面聊出来的。在一个真实的五 session 目录上，按全文打分完全分不开，按开头打分则是主 bot 0 分、每个 alt 3～4 分。
+在有多只 bot 的目录里，`claude-dc -c` 和 `claude-dc-alt N -c` 也走同一条路：`-c` 不再原样传给 claude，而是**改道**到归属判断，其余参数保留。单 bot 目录里 `-c` 原样透传。（`-r` 照常可用，会给一条警告。）
 
-两个函数都不瞎猜：没有明确归属时就新开，并且告诉你。
+**怎么判断归属。** harness 送进来的每条 Discord 消息都会以 `<channel chat_id="…">` 记在 transcript 里，而每只 bot 都通过**自己的私信（DM）频道**跟你说话。所以一个 session 属于**最近一次收到消息的那个 DM 频道**的主人 —— 中途换了手的 session，归现在在驱动它的那只 bot。这是消息实际送达的频道，不是从聊天内容里推断出来的；agent 自己写的文字、它的工具调用和工具输出都不计入。具体由 `claude-dc-pick-session.py` 完成。每只 bot 的 DM 频道 id 用 `POST /users/@me/channels` 查一次（幂等：返回已有的 DM，不会发任何消息），缓存在 `<state 目录>/dm_channel`。这个 DM 指的是 bot 与 `$CLAUDE_DC_OWNER_ID` 的私信；没设这个变量时，取该 bot `access.json` 里 `allowFrom` 的第一个用户。
+
+如果确定不了这只 bot 的 DM 频道，或者这个目录里没有哪个 session 是它最后驱动的，就新开并告诉你原因。它从不瞎猜。
+
+> **为什么不再数关键词？** v2.0 是从 transcript 文本推断归属的 —— alt 数整份 transcript 里 `variant_N` 出现的次数，主 bot 只给 session 开头打分 —— 本 README 当时还说 alt「好办」，按全文计数就行。并不行。一只主 bot 跟它的 alt 聊了几周，自己的 transcript 里攒下了 104 次 `variant_2`；于是目录里每个 session 都被判成 alt 的，alt 接上了主 bot 的对话。这个检查在第一天是通过的；信号随着对话变长而衰减了。只看开头也有类似的毛病：开头说明的是谁**开启**了这个 session，而不是现在谁在驱动它。
 
 ## 🛡️ 机制层（钩子 + 插件补丁）
 
@@ -207,6 +213,7 @@ v1 交付的是**约定**。约定的问题在于：它恰好在最需要的时�
 │   ├── .env                   # DISCORD_BOT_TOKEN=...   (chmod 600)
 │   ├── access.json            # dmPolicy / allowFrom / pending (chmod 600)
 │   ├── approved/<senderId>    # 配对确认信号文件（内容: chatId）
+│   ├── dm_channel             # 本 bot 的 DM 频道 id，由归属判断脚本缓存
 │   └── inbox/                 # 收到的附件（图片等）
 ├── <项目-A-basename>-2/       # 项目 A 的 alt bot
 └── <项目-B-basename>/
@@ -232,6 +239,7 @@ v1 交付的是**约定**。约定的问题在于：它恰好在最需要的时�
 - Bot token 等同密码。`.env` 文件 `chmod 600`，外层目录 `chmod 700`。不要提交到 git，不要在群聊里粘贴。仓库的 `.gitignore` 已默认排除 `.env`、`*.env`、`.claude-discord/`、`.claude/channels/`。
 - `allowFrom` 是 bot 背后 Claude Code 会话的唯一访问门槛。任何在列表里的 Discord snowflake ID 实际上可以"打字"进那个会话。把它当 shell 权限对待。
 - 插件只对 `discord.com/api/v10` 和 `gateway.discord.gg` 发出站请求，没有第三方 endpoint。
+- 归属判断脚本对每只 bot 最多只联网一次 —— 用该 bot 自己的 token 调 `POST discord.com/api/v10/users/@me/channels` 查它的 DM 频道 id —— 结果缓存在 state 目录里。
 - 注意 Developer Portal 里的 "Public Bot" 开关 —— 如果开着，任何拿到你 OAuth URL 的人都可以把这个 bot 装进他们自己的 server。保护好 URL。
 
 ## 🆚 vs Telegram 姐妹仓库

@@ -115,6 +115,8 @@ claude-dc-pair() {
 }
 ```
 
+These are the minimal core. For the session-attributing resume helpers and the multi-bot `-c` reroute, source the repo's full `claude-dc.bash` instead, and copy `claude-dc-pick-session.py` to `~/.claude/` — without it the resume helpers say so and start fresh.
+
 **Important Discord/Telegram pairing schema difference:** In Telegram, `senderId == chatId` for DMs. In Discord, `senderId` is the user's Snowflake ID and `chatId` is the DM channel's Snowflake ID — they are **different numbers**. The pair function above already handles this correctly (it reads both separately from the pending entry).
 
 ## Multiple bots in the same project directory (advanced)
@@ -134,12 +136,12 @@ Note: `claude-dc-pair` only handles the primary state dir. For alt bots, do the 
 | token / pairing | `~/.claude-discord/<base>-N/` | `claude-dc-alt` (automatic, structural) |
 | sandbox + notebook + new scripts | `for_claude_N/`, `For_claude_N.ipynb`, `_N` suffix | your project rules (convention) |
 | auto-memory | `memory/variant_N/` | your project rules (convention) |
-| **sessions / `-c`** | **none — genuinely shared** | launcher warns only |
+| **sessions / `-c`** | **none — genuinely shared** | attributed at resume time by DM channel (`claude-dc-pick-session.py`); `-c` rerouted to it |
 
 Only the first is structural; the rest rely on the bot obeying the rules. Two consequences worth knowing before you add an alt:
 
 1. **The alt bot's built-in memory instructions point at `memory/` root** and know nothing about variants — your project rules must explicitly say they override that. Without that, an alt can overwrite a primary's `MEMORY.md` (real projects here hold ~50 memory files / 12 KB indexes that no transcript can rebuild). Real-world check on a two-bot project showed the split *did* hold in practice (6 root + 4 variant_2 files, no cross-contamination) — the convention works, but it is still a convention.
-2. **`-c` can resume the sibling's session.** Claude Code keys sessions on cwd alone; nothing binds a session to `DISCORD_STATE_DIR`. Verified on a two-bot project: 3 transcripts shared one bucket with no bot binding. `claude-dc`/`claude-dc-alt` now print a non-blocking warning when `-c`/`-r` is used in a directory that has multiple variants. To resume exactly, use `claude --resume <session-id>`.
+2. **Plain `-c` would resume the sibling's session.** Claude Code keys sessions on cwd alone; nothing binds a session to `DISCORD_STATE_DIR`. Verified on a two-bot project: 3 transcripts shared one bucket with no bot binding. So in a directory with more than one bot, `claude-dc -c` / `claude-dc-alt N -c` no longer pass `-c` through — they reroute to the DM-channel picker described below, keeping the other arguments; in a single-bot directory `-c` is passed through unchanged. `-r` cannot be rerouted (it is interactive) and prints a non-blocking warning instead. To resume exactly, use `claude-dc-resume <session-id>`.
 
 **Discord-reply enforcement is now GLOBAL (2026-08-30).** `~/.claude/hooks/enforce-discord-reply.py` (a `Stop` hook) blocks a bot from ending a turn that was triggered by a Discord message but never called `reply`/`react`/`edit_message` — terminal output reaches nobody, and prompt rules alone never fixed the "finished a long tool chain, forgot to reply" slip. Its `ENFORCE_FOR` list lets you stage the rollout — put one or more `DISCORD_STATE_DIR` basenames in it to enforce for those bots only, or `["*"]` for every bot. Tested: Discord-triggered turn with no reply → **block**; reply / react / terminal-triggered turn / `stop_hook_active` / malformed input / missing transcript → **allow** (fail-open everywhere; a guard that wedges sessions is worse than the slip). Takes effect per bot on its next session start.
 
@@ -155,15 +157,18 @@ Only the first is structural; the rest rely on the bot obeying the rules. Two co
 
 Cost of the mistake: the `Stop` discord-reply hook sat in that file from 2026-08-17 and **never once ran for any project bot**; we believed we had a mechanism layer when we only had the prompt rule. Verified fixed 2026-08-30 — after moving both hooks to `~/.claude/settings.json`, an alt bot's probe write to another bot's memory was correctly denied.
 
-**Resuming an alt safely — `claude-dc-alt-resume N`** (added 2026-08-29). Neither `-c` nor `-r` is safe in a multi-variant directory: `-c` silently continues *the newest session in the cwd* regardless of which bot wrote it, and `-r`'s interactive picker lists both siblings **without saying which is which**. `claude-dc-alt-resume <N>` (in `~/.bashrc.d/claude-discord.bash`) scans the cwd's transcripts, scores each by how many times it references `memory/variant_<N>/`, and resumes the **newest one scoring ≥3** — the primary's sessions essentially never write that path. Falls back to a fresh `claude-dc-alt N` when nothing matches (never guesses). Verified against the live kidney project: picked the alt's session (score 21) over the primary's (score 0); variant 3 → correctly matched nothing.
+**Resuming the right session — `claude-dc-resume` / `claude-dc-alt-resume N`** (rewritten in v2.1). Neither `-c` nor `-r` is safe in a multi-variant directory: `-c` continues *the newest session in the cwd* regardless of which bot wrote it, and `-r`'s interactive picker lists the siblings **without saying which is which**. Both helpers go through `~/.claude/claude-dc-pick-session.py`, and so does `-c` in a multi-bot directory.
 
-Two traps found while building it: (a) the primary's transcript *does* contain the string `CLAUDE_BOT_VARIANT` (it reads the rules), so keyword presence alone cannot attribute a session — score on the `variant_N/` **path** instead; (b) `grep -c` can emit multi-line output, which broke the numeric test with "integer expression expected" — pipe through `head -1 | tr -dc '0-9'`.
+**The rule: attribute by the delivery channel, not by what was discussed.** Every inbound Discord message is recorded in the transcript as `<channel chat_id="...">`, and each bot talks to its owner through *its own* private DM channel. A session belongs to the bot whose DM channel it **most recently received a message on**; a session that changed hands belongs to whoever drives it now. The agent's own records (its text and tool calls) and tool results are skipped, so a session that merely *talks about* another bot's DM id — while debugging it, say — is not attributed to that bot. Transcripts with no inbound DM from any sibling are unattributable and skipped.
 
-**Resuming the primary — `claude-dc-resume`.** The mirror image, and it needs a *different* signal. You cannot simply invert the alt's test: the primary's transcript mentions `variant_2` plenty, because you discuss the alt bot inside it. What separates them is **where in the transcript the mention comes from**. Score only the **session opening** (the first ~30 records) — that is what the harness injected: the auto-loaded `MEMORY.md`, the `CLAUDE.md`/rules render. An alt's opening carries its own `variant_<N>/` and `for_claude_<N>` namespace; the primary's carries neither.
+- **Where the DM id comes from:** `POST /users/@me/channels {"recipient_id": <owner>}` with the bot's own token — idempotent, it returns the existing DM and sends nothing. Cached in `<state dir>/dm_channel` (chmod 600), so it runs once per bot. `GET /users/@me/channels` does **not** work for this — it returns `[]` for bot accounts. The owner is `$CLAUDE_DC_OWNER_ID`, else `allowFrom[0]` of the bot's `access.json`; set the env var if a bot has several paired users, and delete `dm_channel` to force a re-lookup.
+- **Siblings are exactly `<base>-<digits>`.** A bare `<base>-[0-9]*` glob also matches an unrelated `<base>-2025notes`; both the picker and `_claude_dc_has_siblings` filter for an exact match. Any number of alts works.
+- **Never guess.** If this bot's DM channel cannot be determined — not paired, no network, picker not installed — the helper says which of those it is and starts fresh. An explicit session id (`claude-dc-resume <sid>`) always wins.
+- **Transcript bucket:** Claude Code names it after the cwd's *physical* path with every non-alphanumeric character turned into `-`. Encoding only `/` and `_` (as v2.0 did) misses directories with a `.` in the name; using the logical `$PWD` misses a project reached through a symlink.
 
-Measured on a real five-session directory: whole-file scoring could not separate the two bots at all, while opening-only scoring gave **0 for the primary and 3-4 for each alt** — no overlap. `claude-dc-resume` picks the newest session scoring 0, prints which one it chose, and takes an explicit session id as an escape hatch. In a directory with only one bot every session scores 0, so it just resumes the newest — which is the right behaviour there anyway.
+**Why the v2.0 text heuristics were replaced.** v2.0 inferred ownership from transcript *text*: `claude-dc-alt-resume` counted `variant_<N>` across the whole transcript (≥3 = the alt's), and `claude-dc-resume` scored only the first ~30 records (0 = the primary's). The alt check passed when it was written — on a real directory the alt scored 21 and the primary 0 — and this file said the primary's sessions "essentially never" mention that path. It failed in production: the primary had discussed its alt so often that its *own* transcript held 104 mentions of `variant_2`, every session in the directory scored ≥3, the helper resumed the newest — the primary's — and the alt picked up the primary's conversation. The opening-only score has a related weakness: the opening says who *started* a session, not who drives it now, and sessions change hands.
 
-The general lesson is worth more than the function: **when attributing a transcript to an agent, score what the harness injected, not what the conversation discussed.**
+The general lesson is worth more than the function: **a check that passes on day one can decay as the conversation grows. When attributing a transcript to an agent, use the channel the harness actually delivered through, not what the conversation discussed** — and re-run the check on old, long transcripts, not just fresh ones.
 
 **MECHANISM (not just convention) — `guard-variant-memory.py`, added 2026-08-29.** Everything above about memory separation is a *convention*: the alt bot has Write/Bash and the same UNIX uid, so nothing structural stops it writing an absolute path into the primary's `memory/` — or into the `$HOME` bot's. So there is now a **`PreToolUse` hook** (`~/.claude/hooks/guard-variant-memory.py`, registered in **`~/.claude/settings.json`** (NOT `settings.local.json` — see below), matcher `Write|Edit|NotebookEdit|Bash`) that **denies** the call outright.
 
@@ -250,7 +255,7 @@ breaks instead of upstream's hard `slice(0, 2000)`. Cheap insurance; set it on e
 cd /full/project/path
 claude-dc          # fresh conversation
 # or
-claude-dc -c       # resume most recent session in this directory
+claude-dc -c       # resume; in a multi-bot directory, this bot's own last session (rerouted to the picker)
 ```
 
 ### Step 5: User DMs the bot
@@ -537,6 +542,7 @@ Same as Telegram: Anthropic's safety classifier can false-positive on bloated se
 │   ├── access.json                # dmPolicy / allowFrom / pending (chmod 600)
 │   ├── bot.pid                    # server.ts PID (Discord plugin may not always write this)
 │   ├── approved/<senderId>        # pairing-confirm signal file
+│   ├── dm_channel                 # this bot's DM channel id, cached by claude-dc-pick-session.py
 │   └── inbox/                     # received attachments
 ├── <project-A-basename>-2/        # alt variant 2
 └── <project-B-basename>/
@@ -552,6 +558,7 @@ The pieces that live outside the state dirs:
 ├── settings.json                  # enabledPlugins + the hooks block — hooks MUST be here,
 │                                  #   NOT in settings.local.json (see the warning above)
 ├── patch-discord-plugin.sh        # the three idempotent server.ts patches
+├── claude-dc-pick-session.py      # which session belongs to which bot (by DM channel)
 └── hooks/
     ├── enforce-discord-reply.py   # Stop: no Discord reply => the turn does not end
     └── guard-variant-memory.py    # PreToolUse: an alt cannot write another bot's memory
@@ -565,6 +572,7 @@ The pieces that live outside the state dirs:
 - Bot tokens grant full control of the bot. `.env` files are `chmod 600` inside `chmod 700` directories. Never commit them, never share OAuth invite URLs widely.
 - `allowFrom` is the only gate to a Claude Code session behind a bot. Discord Snowflake IDs are stable — treat the list as carefully as shell access.
 - The Discord plugin sends outbound traffic only to `discord.com/api/v10` and `gateway.discord.gg`.
+- `claude-dc-pick-session.py` makes at most one call per bot — `POST /users/@me/channels` with that bot's token — and caches the DM id in the state dir.
 - Be cautious with "Public Bot" toggle — if Public, anyone with the OAuth URL can install the bot into their own server. Keep the URL private.
 
 ## Cross-reference

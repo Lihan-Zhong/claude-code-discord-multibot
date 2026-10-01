@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.1
+
+### Fixed
+
+- **`claude-dc-alt-resume` could resume the primary's session.** It decided "is this session the
+  alt's?" by counting `variant_N` across the whole transcript (>= 3 = the alt's). In production a
+  primary bot had discussed its alt so often that its own transcript held 104 mentions of
+  `variant_2`; every session in the directory scored >= 3, the helper picked the newest — the
+  primary's — and the alt resumed the primary's conversation. The check had passed when it was
+  written; the signal decayed as the conversation grew. `claude-dc-resume`'s opening-only score
+  had a related weakness: the opening says who *started* a session, not who drives it now.
+  Both helpers now attribute a session to the bot whose **private DM channel last delivered a
+  message into it** — the channel the harness actually used, not anything that was said. A
+  session that changed hands belongs to whoever drives it now; if a bot's DM channel cannot be
+  determined, the helper starts fresh instead of guessing.
+- v2.0's README and `SKILL.md` said whole-transcript scoring was reliable for the alt, and the
+  v2.0 changelog presented opening-only scoring as the answer. Both are corrected: attribute by
+  the delivery channel, not by what was discussed.
+- Sibling bots are matched exactly as `<base>-<digits>`; a bare `<base>-[0-9]*` glob also caught
+  unrelated state dirs such as `<base>-2025notes`. Any number of alts is supported.
+- The transcript bucket is found the way Claude Code names it — the physical path, every
+  non-alphanumeric character turned into `-` — so directories with a `.` in their name, and
+  projects reached through a symlink, resume correctly.
+- A project whose own name ends in `-<digits>` is no longer mistaken for an alt when resuming
+  (`CLAUDE_BOT_VARIANT` was derived from the state-dir name).
+- If the picker is not installed, the resume helpers say so instead of reporting that no
+  session belongs to this bot.
+
+### Changed
+
+- **`-c` is rerouted in multi-bot directories.** `claude-dc -c` and `claude-dc-alt N -c` no longer
+  pass `-c` through when the directory has more than one bot; they resume through the same
+  DM-channel picker, keeping every other argument. Single-bot directories keep plain `-c`.
+  `-r` still passes through, with a warning.
+- Both resume helpers share one implementation, `_claude_dc_resume_as`.
+
+### Added
+
+- **`claude-dc-pick-session.py`** — install to `~/.claude/`. Prints the session a given bot should
+  resume, or nothing; `-v` explains every transcript. Each bot's DM channel id is looked up once
+  with the idempotent `POST /users/@me/channels` (`GET` returns `[]` for bot accounts) and cached
+  in `<state dir>/dm_channel`. The DM partner is `$CLAUDE_DC_OWNER_ID`, else the first `allowFrom`
+  entry of the bot's `access.json`. Only deliveries count: the agent's own text, tool calls and
+  tool output are ignored, so a session that merely discusses another bot's DM id is not
+  attributed to it.
+
 ## v2.0
 
 v1 shipped a set of conventions and a skill that taught an agent to follow them. Three months of
