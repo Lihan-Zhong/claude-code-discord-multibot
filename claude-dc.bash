@@ -77,7 +77,7 @@ _claude_dc_resume_warn() {
 _claude_dc_has_siblings() {
   local d
   for d in "$HOME/.claude-discord/$1"-[0-9]*; do
-    [ -d "$d" ] && [[ "$(basename "$d")" =~ ^.+-[0-9]+$ ]] && [ "${d%-*}" = "$HOME/.claude-discord/$1" ] && return 0
+    [ -f "$d/.env" ] && [[ "$(basename "$d")" =~ ^.+-[0-9]+$ ]] && [ "${d%-*}" = "$HOME/.claude-discord/$1" ] && return 0
   done
   return 1
 }

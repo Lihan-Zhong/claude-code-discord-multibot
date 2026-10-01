@@ -84,15 +84,20 @@ def main():
         allow()
 
     try:
-        mine = f"/memory/variant_{variant}"
+        # Our own namespace is exactly THIS project's memory/variant_<N> — compared as real paths.
+        # A substring test let alt-1 write variant_10, and any alt write variant_N of OTHER projects.
+        cwd = payload.get("cwd") or os.getcwd()
+        bucket = re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(cwd))
+        mine = os.path.realpath(os.path.join(os.path.expanduser("~"), ".claude", "projects",
+                                             bucket, "memory", f"variant_{variant}"))
         for raw in candidate_paths(tool, ti):
             p = os.path.expanduser(os.path.expandvars(raw))
             if not os.path.isabs(p):
-                p = os.path.abspath(p)
-            p = os.path.normpath(p)
+                p = os.path.join(cwd, p)
+            p = os.path.realpath(p)
             if not MEM_RE.search(p):
                 continue             # not a memory path at all
-            if mine in p:
+            if p == mine or p.startswith(mine + os.sep):
                 continue             # our own namespace — fine
             deny(
                 f"BLOCKED: you are alt-{variant} (CLAUDE_BOT_VARIANT={variant}), so the only memory "

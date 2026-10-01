@@ -81,7 +81,7 @@ def dm_channel(state_dir):
     """This bot's DM channel with its owner, cached in <state_dir>/dm_channel."""
     cache = os.path.join(state_dir, "dm_channel")
     try:
-        with open(cache) as fh:
+        with open(cache, errors="replace") as fh:
             v = fh.read().strip()
         if v.isdigit():
             return v
@@ -194,13 +194,30 @@ def main():
         alts = [n for n in os.listdir(root) if alt_re.fullmatch(n)]
     except OSError:
         alts = []
+    # Every configured sibling must be identifiable. If one is skipped, a session it drove last can
+    # be credited to whichever bot drove that session BEFORE it — a wrong resume. So an unknown or a
+    # duplicated channel is a refusal, not a gap. (A dir without .env is not a bot: e.g. one left
+    # behind by a claude-dc-alt that failed before its token was written.)
     siblings = {}
     for n in [base] + sorted(alts, key=lambda n: int(alt_re.fullmatch(n).group(1))):
         d = os.path.join(root, n)
-        if os.path.isfile(os.path.join(d, ".env")):
-            c = dm_channel(d)
-            if c:
-                siblings[c] = n
+        if not os.path.isfile(os.path.join(d, ".env")):
+            continue
+        c = dm_channel(d)
+        if not c:
+            print(f"claude-dc-pick-session: cannot determine the DM channel of sibling bot {n};"
+                  " refusing to guess which session is whose", file=sys.stderr)
+            return 2
+        if c in siblings and siblings[c] != n:
+            print(f"claude-dc-pick-session: bots {siblings[c]} and {n} both report DM channel {c};"
+                  " their state is inconsistent (copied state dir? stale dm_channel cache?)."
+                  " Refusing to guess", file=sys.stderr)
+            return 2
+        siblings[c] = n
+    if siblings.get(me, os.path.basename(state)) != os.path.basename(state):
+        print(f"claude-dc-pick-session: this bot and {siblings[me]} both report DM channel {me};"
+              " refusing to guess", file=sys.stderr)
+        return 2
     siblings[me] = os.path.basename(state)
 
     tdir = transcript_dir(cwd)

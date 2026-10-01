@@ -27,6 +27,17 @@
   (`CLAUDE_BOT_VARIANT` was derived from the state-dir name).
 - If the picker is not installed, the resume helpers say so instead of reporting that no
   session belongs to this bot.
+- **The picker refuses rather than guesses when a sibling cannot be identified.** If any configured
+  bot in the directory has no determinable DM channel, or two state dirs report the same one, every
+  bot there starts fresh. Silently dropping the unknown sibling made its deliveries invisible, so a
+  session it had taken over was still attributed to whoever drove it before — the original failure.
+- `guard-variant-memory.py` allowed too much: its "own namespace" test was a substring match, so
+  alt 1 could write `variant_10/`, and any alt could write `variant_N/` of any other project. The
+  own namespace is now exactly this project's `memory/variant_N/`, compared as real paths, with
+  relative paths resolved against the session's working directory.
+- An empty `<base>-N` directory without a `.env` no longer makes a single-bot directory look
+  multi-bot (which rerouted its `-c`).
+- A corrupt `dm_channel` cache no longer crashes the picker with a traceback.
 
 ### Changed
 
