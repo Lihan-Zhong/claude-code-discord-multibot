@@ -190,9 +190,10 @@ This one cost two weeks of a hook that never ran, with no error and no warning. 
 
 `patch-discord-plugin.sh` edits a file the plugin owns, so a plugin upgrade overwrites it. That is handled, but it is worth knowing how:
 
-- The launcher calls the script on every shell start; it is idempotent, so it is a no-op until it is needed.
+- The launcher calls the script on every shell start. Once everything is patched and verified, it exits in a few milliseconds, without taking a lock or running bun.
+- **Shells often start together** (tmux restoring windows, a burst of `srun` shells), so the script is a concurrent program: runs are serialized with `flock`. On Lustre, `$HOME` needs the cluster-coherent `flock` mount option (`findmnt -no OPTIONS -T ~/.claude | tr , '\n' | grep -x flock`); `localflock` only covers one node. Before v2.2, concurrent runs could stack patches on top of one another and leave a `server.ts` that does not parse — or one that parses and then crashes when the plugin loads.
 - The running plugin loads from the **cache** copy (`~/.claude/plugins/cache/.../discord/<version>/server.ts`), pinned by version. An upgrade creates a new version directory, and the patch target is a glob, so it is covered.
-- If upstream renames `chunk()` entirely, the script prints `[warn]` and **leaves the file alone** rather than writing something broken. Patch #3 additionally runs a transpile check and reverts itself if the result no longer parses.
+- If upstream renames `chunk()` entirely, the script prints `[warn]` and **leaves the file alone** rather than writing something broken. Every write is checked afterwards — a transpile (does it parse?) plus a declaration check (is every name our patches add declared exactly once?) — and reverted if either fails. A target that is already unusable before patching is restored from the pristine upstream copy patch #1 saved, then re-patched.
 - Belt and braces: set `"chunkMode": "newline"` in each bot's `access.json`. It does nothing while patch #3 is in place, and it means that with the patch entirely absent you still get clean line breaks instead of a hard `slice(0, 2000)`.
 
 **A running bot keeps the old code until it restarts.** Patching does not affect a live session.

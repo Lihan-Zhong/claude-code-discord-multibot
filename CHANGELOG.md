@@ -1,5 +1,45 @@
 # Changelog
 
+## v2.2
+
+### Fixed
+
+- **`patch-discord-plugin.sh` raced itself.** It runs at every shell start, and shells often start
+  together — tmux restoring its windows, a burst of `srun` shells, bot sessions building their shell
+  snapshot. Concurrent runs each saw "not patched yet", applied their edits on top of one another and
+  shared one `.bak` path, so one run's revert clobbered another's work. In practice this left
+  `chunk()`'s `FENCE_RE` declared twice: the file no longer parses, and every later patch then
+  reported "did not parse". In testing it could also leave a file that parses but dies the moment the
+  plugin loads (`ReferenceError: BOT_NODE is not defined`). Reproduced with 6–8 concurrent runs on a
+  fresh `server.ts`. Runs are now serialized with `flock`, which the kernel releases when a holder dies
+  (even on `kill -9`), so there is no stale lock to detect. On Lustre, `$HOME` needs the
+  cluster-coherent `flock` mount option for this to hold across nodes; where flock is not supported
+  at all, the script warns and runs unserialized as before.
+- Patch #2 (presence) was not idempotent on what it read: run on an already patched file, its
+  legacy-cleanup regex removed our own `BOT_BASE` / `BOT_NODE`. It now checks the content first, and
+  it is gated and reverted like patch #3.
+
+### Added
+
+- **Self-repair.** Before patching, a target that is already unusable — it fails the transpile check,
+  or a name our patches add is used but never declared, or declared twice — is restored from the
+  pristine upstream copy that patch #1 saved, then patched from scratch. With no clean copy it is left
+  alone, with one clear error. Patch #1 only ever saves a file that carries none of our patches.
+- **A declaration check next to the syntax check.** A transpile only proves a file parses; it cannot
+  see a `const` the rest of the file depends on going missing. Every write is now checked for both
+  and reverted if either fails.
+- **A fast path.** A target that carries every patch and still matches its `<file>.verified` stamp
+  (size and mtime of the file that last passed both checks) is trusted without running bun, so a
+  normal shell start stays at a few milliseconds and takes no lock.
+
+### Changed
+
+- bun is probed before it is relied on and runs from `/`, so a stray `bunfig.toml` in the current
+  directory cannot make every file look broken. Without a working bun, patch #3 is skipped for that
+  run instead of files being reported as unusable.
+- A failed `.verified` write is ignored (it only costs the fast path), and error messages now quote
+  the actual parse or declaration error.
+
 ## v2.1
 
 ### Fixed

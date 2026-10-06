@@ -5,6 +5,7 @@
 #
 # Idempotent: re-running on already-patched files is a no-op.
 # Run after every Discord plugin upgrade.
+# Safe to run from many shells at once: runs are serialized by a lock (see "One run at a time").
 #
 # Pass --quiet (used from .bashrc) to silence the "already patched" noise;
 # the script still speaks when it actually applies a patch or sees an
@@ -24,6 +25,128 @@ TARGETS=(
   "$HOME/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/discord/server.ts"
 )
 
+# What each of the three patches leaves behind (for patch 1, the replacement line itself).
+MARKERS=("$NEW" "const BOT_NODE" "MD-SAFE CHUNKER")
+all_marked() { local m; for m in "${MARKERS[@]}"; do grep -qF -- "$m" "$1" || return 1; done; }
+# Markers alone are not proof: the old unserialized runs could leave every marker in place AND a
+# duplicate or a missing declaration (reproduced). So a fully patched file is trusted only if it is
+# the exact file that last passed the full check (parse + declarations) — its size and mtime are
+# recorded in "<file>.verified".
+stamp_of() { stat -c '%s %Y' "$1" 2>/dev/null; }
+verified() { [ -f "$1.verified" ] && [ "$(stamp_of "$1")" = "$(cat "$1.verified" 2>/dev/null)" ]; }
+
+# Fast path — the common case on every shell start: everything is already patched and verified.
+# Read-only: no lock, no syntax check, so opening a shell costs no more than it did before.
+if [ "$QUIET" -eq 1 ]; then
+  fast=1
+  for pattern in "${TARGETS[@]}"; do
+    for f in $pattern; do
+      [ -f "$f" ] || continue
+      if [ ! -s "$f" ] || ! all_marked "$f" || ! verified "$f"; then fast=0; fi
+    done
+  done
+  if [ "$fast" -eq 1 ]; then exit 0; fi
+fi
+
+# --- One run at a time (2026-10-06) ---
+# Every shell start runs this script, and several shells often start together (tmux restoring
+# windows, a burst of srun shells, bot sessions building their shell snapshot). Unserialized, each
+# run saw "not patched yet", they shared one .bak path, and one run's revert clobbered another's
+# work. Once (2026-10-06, after a plugin refresh) that left the marketplace copy with FENCE_RE
+# declared twice — a file that no longer parses, so every later patch "did not parse" on top of it.
+# Reproduced: 8 concurrent runs on a fresh server.ts left patches missing in 6 of 6 trials.
+# flock serializes runs across processes, and across nodes when $HOME is on a cluster filesystem
+# that supports it — Lustre needs the cluster-coherent `flock` mount option (check: findmnt -no
+# OPTIONS -T ~/.claude | tr , '\n' | grep -x flock; `localflock` covers one node only). The kernel
+# drops the lock the moment its holder dies, even on kill -9, so there is no stale lock to judge.
+# (The first version used mkdir + an mtime check; review showed that breaking a "stale" lock is not
+# atomic and that a run could release another run's lock.) The wait is short on purpose: a run takes
+# under a second, Claude Code allows a session's whole shell-startup snapshot 10 s, and a waiter that
+# gives up loses nothing — the holder is doing the same idempotent work. Never delete the lock file:
+# deleting a flock file while others hold it reopens the race.
+[ -d "$HOME/.claude" ] || exit 0
+LOCKF="$HOME/.claude/.patch-discord-plugin.flock"
+if ! { exec 9>>"$LOCKF"; } 2>/dev/null; then
+  echo "[discord-patch] cannot open $LOCKF (home full or read-only?) — patches not applied" >&2
+  exit 0
+fi
+lock_rc=0; flock -E 75 -w 3 9 2>/dev/null || lock_rc=$?
+if [ "$lock_rc" -eq 75 ]; then           # another run holds it — and is doing this same work
+  [ "$QUIET" -eq 1 ] || echo "[warn] another patch run holds $LOCKF — skipped this run" >&2
+  exit 0
+elif [ "$lock_rc" -ne 0 ]; then          # this filesystem cannot flock at all: run unserialized
+  [ "$QUIET" -eq 1 ] || echo "[warn] cannot flock $LOCKF on this filesystem — running unserialized" >&2
+fi
+rmdir "$HOME/.claude/.patch-discord-plugin.lock" 2>/dev/null || true   # leftover of the mkdir version
+
+# Transpile-only syntax check (no import resolution, ~20 ms). parse_err prints the first line of
+# the parse error, and fails, when "$1" does not parse.
+SYNGATE='const s=await Bun.file(Bun.env.SYNCHK_FILE).text(); try{ new Bun.Transpiler({loader:"ts"}).transformSync(s) }catch(e){ console.error(String(e).split("\n")[0]); process.exit(1) }'
+# Run from / so the shell's cwd cannot matter (a stray bunfig.toml there makes bun itself fail).
+parse_err() { (cd / && SYNCHK_FILE="$1" bun -e "$SYNGATE" 2>&1 >/dev/null); }
+# bun must actually RUN, not merely be on PATH — otherwise every file would look broken. Probe it.
+HAVE_BUN=0
+if command -v bun >/dev/null 2>&1 && parse_err /dev/null >/dev/null; then HAVE_BUN=1; fi
+
+# Parsing is not enough: a file can parse and still die at load. The old race could leave
+# presenceLabel() calling BOT_NODE with no `const BOT_NODE` left ("ReferenceError: BOT_NODE is not
+# defined" the moment the plugin starts). The names our patches introduce must each be declared
+# exactly once wherever they are used. decl_err prints what is wrong and fails.
+DECLCHK='
+import re, sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+names = {"BOT_BASE": "const", "BOT_NODE": "const", "SLURM_JOB_ID": "const", "FENCE_RE": "const",
+         "slurmTimeLeft": "function", "presenceLabel": "function"}
+bad = []
+for n, kind in names.items():
+    d = len(re.findall(r"^\s*%s\s+%s\b" % (kind, n), s, flags=re.M))
+    u = len(re.findall(r"\b%s\b" % n, s)) - d
+    if d > 1:
+        bad.append("%s declared %d times" % (n, d))
+    elif d == 0 and u > 0:
+        bad.append("%s used but never declared" % n)
+if bad:
+    print("; ".join(bad))
+    sys.exit(1)
+'
+decl_err() { python3 -c "$DECLCHK" "$1"; }
+# file_err: why "$1" is unusable (a parse error or a broken declaration); fails if it is.
+file_err() {
+  local e
+  if [ "$HAVE_BUN" -eq 1 ] && ! e=$(parse_err "$1"); then echo "$e"; return 1; fi
+  if ! e=$(decl_err "$1"); then echo "$e"; return 1; fi
+  return 0
+}
+
+# --- Pre-flight: never stack patches on a file that is already unusable (2026-10-06) ---
+# A file that is broken BEFORE we touch it makes every later patch look broken — that is how the
+# duplicate FENCE_RE above surfaced as later patches that "did not parse". Repair such a file from the
+# pristine upstream copy patch 1 saved (it must parse and carry none of our markers), then patch
+# from scratch. With no clean copy, leave the file alone, say so, and skip it. A fully patched file
+# whose .verified stamp still matches is skipped: it is the very file that passed last time.
+declare -A BROKEN=()
+if [ "$HAVE_BUN" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  echo "[warn] bun not usable here — cannot syntax-check, so patch 3 is skipped this run" >&2
+fi
+for pattern in "${TARGETS[@]}"; do
+  for f in $pattern; do
+    [ -s "$f" ] || continue
+    if all_marked "$f" && verified "$f"; then continue; fi
+    if err=$(file_err "$f"); then continue; fi
+    clean="$f.bak.predisco-botbot"
+    if [ -s "$clean" ] && file_err "$clean" >/dev/null \
+       && ! grep -qF -e "$NEW" -e "const BOT_NODE" -e "MD-SAFE CHUNKER" "$clean"; then
+      cp "$f" "$f.bak.unusable"            # the latest broken copy, for diagnosis (one file, not one per run)
+      cp "$clean" "$f.tmp.$$"
+      mv -f "$f.tmp.$$" "$f"
+      echo "[fix]  server.ts was unusable ($err) — restored the pristine upstream copy, re-patching: $f" >&2
+    else
+      BROKEN["$f"]=1
+      echo "[ERR]  server.ts is unusable even before patching ($err), and there is no clean copy to restore — left untouched: $f" >&2
+    fi
+  done
+done
+
 patched=0
 already=0
 missing=0
@@ -33,6 +156,7 @@ for pattern in "${TARGETS[@]}"; do
     if [ ! -f "$f" ]; then
       continue
     fi
+    if [ -n "${BROKEN[$f]:-}" ]; then continue; fi
     # A 0-byte / truncated server.ts means something clobbered it (seen 2026-08-12: the
     # marketplace copy was emptied). Never patch garbage — say so loudly and skip, so the
     # real file can be restored from the other copy instead of masking the breakage.
@@ -52,8 +176,11 @@ for pattern in "${TARGETS[@]}"; do
       echo "[warn] expected line not found in: $f" >&2
       continue
     fi
-    # In-place edit with backup
-    cp "$f" "$f.bak.predisco-botbot"
+    # In-place edit with backup. The backup is the pre-flight's restore source, so only a truly
+    # pristine file (none of our markers) may overwrite it.
+    if ! grep -qF -e "const BOT_NODE" -e "MD-SAFE CHUNKER" "$f"; then
+      cp "$f" "$f.bak.predisco-botbot"
+    fi
     sed -i "s|$OLD|$NEW|" "$f"
     patched=$((patched + 1))
     echo "[ok]   patched (re-applied after plugin update?): $f" >&2
@@ -68,14 +195,23 @@ for pattern in "${TARGETS[@]}"; do
   for f in $pattern; do
     [ -f "$f" ] || continue
     if [ ! -s "$f" ]; then continue; fi          # empty file already reported by patch 1
+    if [ -n "${BROKEN[$f]:-}" ]; then continue; fi
     if grep -qF "const BOT_NODE" "$f"; then
       [ "$QUIET" -eq 1 ] || echo "[skip] presence+countdown already patched: $f"
       continue
     fi
+    cp "$f" "$f.bak.prepresence"
     python3 - "$f" <<'PYEOF'
 import sys, re
 f=sys.argv[1]
 s=open(f,encoding='utf-8').read()
+# Idempotent on what we actually read. On an already patched file the legacy-strip regex below
+# matches the head of OUR block and deletes BOT_BASE/BOT_NODE (seen in review) — never run it there.
+if "const BOT_NODE" in s:
+    raise SystemExit(0)
+if "function slurmTimeLeft" in s:
+    print("[warn] presence block only partly present — left for the pre-flight to restore:", f)
+    raise SystemExit(0)
 
 # Drop any older presence-only patch so we can re-inject the full version.
 s=re.sub(r"// Presence label from the per-bot state dir[\s\S]*?\}\)\(\)\n", "", s, count=1)
@@ -149,7 +285,15 @@ if "function slurmTimeLeft" not in s or len(s) < 1000:
 open(f,'w',encoding='utf-8').write(s)
 print("[ok]   presence+countdown patched (re-applied after plugin update?):", f)
 PYEOF
-    pres_patched=$((pres_patched + 1))
+    # Same gate as patch 3: revert if the edit left the file unusable.
+    if ! cmp -s "$f" "$f.bak.prepresence"; then
+      if err=$(file_err "$f"); then
+        pres_patched=$((pres_patched + 1))
+      else
+        mv -f "$f.bak.prepresence" "$f"
+        echo "[ERR]  presence+countdown patch left the file unusable ($err) — REVERTED: $f" >&2
+      fi
+    fi
   done
 done
 
@@ -166,11 +310,12 @@ done
 # rename of a parameter still patches. That is only safe because every patched file then goes
 # through a transpile-only syntax gate below and is REVERTED if it no longer parses.
 chunk_patched=0
-SYNGATE='const s=await Bun.file(Bun.env.SYNCHK_FILE).text(); try{ new Bun.Transpiler({loader:"ts"}).transformSync(s) }catch(e){ console.error(String(e).split("\n")[0]); process.exit(1) }'
+# (SYNGATE / parse_err are defined at the top of the script.)
 for pattern in "${TARGETS[@]}"; do
   for f in $pattern; do
     [ -f "$f" ] || continue
     if [ ! -s "$f" ]; then continue; fi          # empty file already reported by patch 1
+    if [ "$HAVE_BUN" -eq 0 ] || [ -n "${BROKEN[$f]:-}" ]; then continue; fi
     if grep -qF "MD-SAFE CHUNKER" "$f"; then
       [ "$QUIET" -eq 1 ] || echo "[skip] md-safe chunker already patched: $f"
       continue
@@ -181,6 +326,8 @@ import re, sys
 f = sys.argv[1]
 s = open(f, encoding='utf-8').read()
 orig = s
+if "MD-SAFE CHUNKER" in s:          # idempotent on what we actually read
+    raise SystemExit(0)
 
 # Loose anchor: any declaration of chunk(), whatever its parameters are called.
 m = re.search(r"\bfunction\s+chunk\s*\(", s)
@@ -314,15 +461,27 @@ PYEOF
     # Syntax gate: transpile only (no import resolution, ~20 ms). A loose anchor is only safe
     # with this — if the edit produced something that no longer parses, put the file back.
     if grep -qF "MD-SAFE CHUNKER" "$f"; then
-      if SYNCHK_FILE="$f" bun -e "$SYNGATE" >/dev/null 2>&1; then
+      if err=$(file_err "$f"); then
         chunk_patched=$((chunk_patched + 1))
       else
         mv -f "$f.bak.prechunk" "$f"
-        echo "[ERR]  md-safe chunker patch did not parse — REVERTED: $f" >&2
+        echo "[ERR]  md-safe chunker patch did not parse ($err) — REVERTED: $f" >&2
       fi
     fi
   done
 done
+
+# Stamp every fully patched file that parses, so the fast path can trust it next time.
+if [ "$HAVE_BUN" -eq 1 ]; then
+  for pattern in "${TARGETS[@]}"; do
+    for f in $pattern; do
+      [ -s "$f" ] || continue
+      if all_marked "$f" && ! verified "$f" && [ "$HAVE_BUN" -eq 1 ] && file_err "$f" >/dev/null; then
+        { stamp_of "$f" > "$f.verified"; } 2>/dev/null || true    # best-effort: no stamp only costs the fast path
+      fi
+    done
+  done
+fi
 
 if [ "$QUIET" -eq 0 ]; then
   echo
